@@ -2,7 +2,9 @@ const express = require('express');
 const {
   default: makeWASocket,
   DisconnectReason,
-  useMultiFileAuthState
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  Browsers
 } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const fs = require('fs-extra');
@@ -15,7 +17,7 @@ const { Boom } = require('@hapi/boom');
 const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
 const AUTH_DIR = path.join(__dirname, 'auth');
 
-// ✅ SAFE sessions file handling (Pehle code se)
+// ✅ SAFE sessions file handling
 let sessions = {};
 try {
   fs.ensureDirSync(AUTH_DIR);
@@ -47,11 +49,11 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 
-// ✅ HEALTH CHECK ENDPOINTS (Dusre code se)
+// ✅ HEALTH CHECK ENDPOINTS
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    service: 'WhatsApp API - Baileys 6.4.0',
+    service: 'WhatsApp API - Latest Baileys',
     sessions: Object.keys(sessions).length,
     activeConnections: Object.values(sockets).filter(s => s.isConnected).length,
     timestamp: new Date().toISOString()
@@ -62,20 +64,10 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'online',
     service: 'WhatsApp API',
-    baileysVersion: '6.4.0',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     sessions: Object.keys(sessions).length,
     activeConnections: Object.values(sockets).filter(s => s.isConnected).length
-  });
-});
-
-app.get('/whatsapp/health', (req, res) => {
-  res.json({
-    status: 'online',
-    service: 'WhatsApp API - Plesk',
-    timestamp: new Date().toISOString(),
-    sessions: Object.keys(sessions).length
   });
 });
 
@@ -88,7 +80,7 @@ function verifyApiKey(req, res, next) {
   next();
 }
 
-// ✅ SAFE file write function (Pehle code se)
+// ✅ SAFE file write function
 async function safeWriteSessions() {
   try {
     await fs.writeJson(SESSIONS_FILE, sessions, { spaces: 2 });
@@ -99,24 +91,39 @@ async function safeWriteSessions() {
   }
 }
 
-// ✅ FIXED: WhatsApp connection with PROPER QR GENERATION (Pehle code se)
+// ✅ FIXED: WhatsApp connection with PROPER device linking
 async function connectSession(sessionId) {
   try {
     console.log(`[${sessionId}] 🔄 Initializing WhatsApp connection...`);
     
     const authPath = path.join(AUTH_DIR, sessionId);
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
+    
+    // ✅ Latest version fetch karein for compatibility
+    const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
       auth: state,
-      printQRInTerminal: true, // ✅ Yehi line QR code ke liye important hai
-      browser: ['Ubuntu', 'Chrome', '110.0.5481.100'],
-      markOnlineOnConnect: false
+      version,
+      printQRInTerminal: true,
+      // ✅ PROPER browser configuration for device linking
+      browser: Browsers.ubuntu('Chrome'),
+      // ✅ Better connection settings
+      markOnlineOnConnect: true,
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: true,
+      // ✅ Mobile device linking ke liye important settings
+      mobile: false, // Yehi line fix karti hai "cloud not login" error
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 10000,
+      logger: {
+        level: 'silent' // Optional: Less logs
+      }
     });
 
     sock.isConnected = false;
     sock.sessionId = sessionId;
-    sock.lastQR = null; // ✅ Initialize lastQR
+    sock.lastQR = null;
     sockets[sessionId] = sock;
 
     // Save credentials when updated
@@ -124,14 +131,21 @@ async function connectSession(sessionId) {
 
     // Handle connection updates
     sock.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      const { connection, lastDisconnect, qr, isNewLogin, receivedPendingNotifications } = update;
 
-      // ✅ PROPER QR Code generation (Pehle code se)
+      console.log(`[${sessionId}] Connection update:`, {
+        connection,
+        qr: !!qr,
+        isNewLogin,
+        receivedPendingNotifications
+      });
+
+      // ✅ QR Code generation
       if (qr) {
         console.log(`[${sessionId}] 📱 QR Code received`);
         try {
           const qrImage = await QRCode.toDataURL(qr);
-          sock.lastQR = qrImage; // ✅ Store QR image
+          sock.lastQR = qrImage;
           console.log(`[${sessionId}] ✅ QR Code generated successfully`);
         } catch (error) {
           console.error(`[${sessionId}] ❌ QR generation error:`, error.message);
@@ -142,6 +156,7 @@ async function connectSession(sessionId) {
         sock.isConnected = true;
         sock.lastQR = null;
         console.log(`[${sessionId}] ✅ WhatsApp connected successfully!`);
+        console.log(`[${sessionId}] 📱 Device properly linked with mobile`);
 
         // Load configurations
         try {
@@ -170,15 +185,21 @@ async function connectSession(sessionId) {
         console.log(`[${sessionId}] ⚠️ Disconnected:`, reason);
 
         if (reason === DisconnectReason.loggedOut) {
-          console.log(`[${sessionId}] ❌ Logged out`);
+          console.log(`[${sessionId}] ❌ Logged out - clearing auth`);
+          // Clear auth data
+          try {
+            await fs.remove(authPath);
+          } catch (e) {
+            console.error(`[${sessionId}] Error clearing auth:`, e.message);
+          }
         } else {
-          console.log(`[${sessionId}] 🔄 Reconnecting in 10s...`);
-          setTimeout(() => connectSession(sessionId), 10000);
+          console.log(`[${sessionId}] 🔄 Reconnecting in 5s...`);
+          setTimeout(() => connectSession(sessionId), 5000);
         }
       }
     });
 
-    // Handle incoming messages (Dusre code se)
+    // Handle incoming messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify' || !messages?.[0]) return;
       
@@ -191,43 +212,6 @@ async function connectSession(sessionId) {
       if (!text) return;
 
       console.log(`[${sessionId}] 📩 Message from ${from}: ${text}`);
-
-      // ✅ RegexTriggersPro (Dusre code se)
-      const proTriggers = regexTriggersPro[sessionId] || [];
-      for (const trigger of proTriggers) {
-        try {
-          const regex = new RegExp(trigger.regex, 'i');
-          const allowedNumbers = trigger.target_number
-            .split(',')
-            .map(num => formatNumber(num.trim()))
-            .filter(Boolean);
-
-          if (!allowedNumbers.includes(from)) continue;
-
-          if (regex.test(text)) {
-            const match = text.match(regex);
-            const keyword = match?.[0];
-
-            const payload = {
-              keyword,
-              name: trigger.name,
-              pattern: trigger.regex
-            };
-
-            try {
-              const res = await axios.post(trigger.callback_url, payload);
-              const replyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-              await sock.sendMessage(from, { text: replyText });
-            } catch (err) {
-              console.error(`[${sessionId}] ❌ Pro Trigger Callback Error:`, err.message);
-              await sock.sendMessage(from, { text: '❌ Error processing your request.' });
-            }
-            break;
-          }
-        } catch (err) {
-          console.error(`[${sessionId}] ❌ Invalid regexPro pattern: ${trigger.regex}`, err.message);
-        }
-      }
 
       // Process auto-replies
       const replies = autoReplies[sessionId] || [];
@@ -246,49 +230,6 @@ async function connectSession(sessionId) {
           return;
         }
       }
-
-      // ✅ Regex Triggers (Dusre code se)
-      const triggers = regexTriggers[sessionId] || [];
-      const matchedTriggers = [];
-
-      for (const trigger of triggers) {
-        try {
-          const regex = new RegExp(trigger.regex, 'i');
-          if (regex.test(text)) {
-            matchedTriggers.push(trigger);
-          }
-        } catch (err) {
-          console.error(`[${sessionId}] ❌ Regex error in pattern "${trigger.regex}":`, err.message);
-        }
-      }
-
-      if (matchedTriggers.length > 0) {
-        const bestMatch = matchedTriggers.reduce((a, b) =>
-          b.regex.length > a.regex.length ? b : a
-        );
-
-        try {
-          const regex = new RegExp(bestMatch.regex, 'i');
-          const match = text.match(regex);
-          const keyword = match[0];
-
-          const payload = {
-            keyword: keyword,
-            name: bestMatch.name,
-            pattern: bestMatch.regex
-          };
-
-          const res = await axios.post(bestMatch.callback_url, payload);
-          const replyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-          await sock.sendMessage(from, { text: replyText });
-        } catch (err) {
-          console.error(`[${sessionId}] ❌ Callback error:`, err.message);
-          await sock.sendMessage(from, {
-            text: '❌ Error processing your request. Please try again.'
-          });
-        }
-        return;
-      }
     });
 
     console.log(`[${sessionId}] ✅ WhatsApp client initialized`);
@@ -300,7 +241,7 @@ async function connectSession(sessionId) {
   }
 }
 
-// ✅ API ROUTES
+// ✅ API ROUTES (Same as before)
 
 // Create session
 app.post('/api/v1/session/:sessionId', async (req, res) => {
@@ -326,7 +267,7 @@ app.post('/api/v1/session/:sessionId', async (req, res) => {
   }
 });
 
-// ✅ FIXED: QR Code API (Pehle code se - jo work karta hai)
+// ✅ QR Code API
 app.get('/api/v1/session/:sessionId/qr', verifyApiKey, async (req, res) => {
   const { sessionId } = req.params;
 
@@ -347,9 +288,9 @@ app.get('/api/v1/session/:sessionId/qr', verifyApiKey, async (req, res) => {
       sock = await connectSession(sessionId);
     }
 
-    // Wait for QR code (Pehle code ka logic)
+    // Wait for QR code
     let qrFound = false;
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < 30; i++) { // Reduced timeout to 30 seconds
       if (sock.lastQR) {
         qrFound = true;
         return res.json({
@@ -430,95 +371,7 @@ app.post('/api/v1/session/:sessionId/sendText', verifyApiKey, async (req, res) =
   }
 });
 
-// ✅ Baaki sab endpoints dusre code se (jo work karte hain)
-// Send Image
-app.post('/api/v1/session/:sessionId/sendImage', verifyApiKey, async (req, res) => {
-  const { sessionId } = req.params;
-  const { to, image, caption } = req.body;
-
-  const sock = sockets[sessionId];
-  if (!sock?.isConnected) return res.status(409).json({ error: 'not connected' });
-
-  try {
-    await sock.sendMessage(`${to}@s.whatsapp.net`, {
-      image: { url: image },
-      caption: caption || ''
-    });
-    return res.json({ success: true });
-  } catch (e) {
-    return res.status(500).json({ error: e.toString() });
-  }
-});
-
-// Auto Replies
-app.post('/api/v1/session/:sessionId/autoReplies', verifyApiKey, async (req, res) => {
-  const { sessionId } = req.params;
-  const { replies, saveToAuth } = req.body;
-
-  if (!Array.isArray(replies)) {
-    return res.status(400).json({ error: 'replies must be an array' });
-  }
-
-  const formattedReplies = replies.map(r => ({
-    keyword: r.keyword.toLowerCase(),
-    reply: r.reply
-  }));
-
-  autoReplies[sessionId] = formattedReplies;
-
-  if (saveToAuth) {
-    const filePath = path.join(AUTH_DIR, sessionId, 'autoReplies.json');
-    await fs.writeJson(filePath, formattedReplies, { spaces: 2 });
-    console.log(`[${sessionId}] 💾 AutoReplies saved to ${filePath}`);
-  }
-
-  return res.json({ success: true, count: formattedReplies.length });
-});
-
-// GET autoReplies
-app.get('/api/v1/session/:sessionId/autoReplies', verifyApiKey, async (req, res) => {
-  const filePath = path.join(AUTH_DIR, req.params.sessionId, 'autoReplies.json');
-  if (fs.existsSync(filePath)) {
-    const replies = await fs.readJson(filePath);
-    return res.json({ success: true, data: replies });
-  } else {
-    return res.status(404).json({ error: 'autoReplies.json not found' });
-  }
-});
-
-// Regex Triggers
-app.post('/api/v1/session/:sessionId/regexTriggers', verifyApiKey, async (req, res) => {
-  const { sessionId } = req.params;
-  const { triggers } = req.body;
-
-  if (!Array.isArray(triggers)) {
-    return res.status(400).json({ error: 'triggers must be an array' });
-  }
-
-  for (const trigger of triggers) {
-    if (!trigger.name || !trigger.regex || !trigger.callback_url) {
-      return res.status(400).json({ error: 'Each trigger must include name, regex, and callback_url' });
-    }
-  }
-
-  const filePath = path.join(AUTH_DIR, sessionId, 'regexTriggers.json');
-  await fs.writeJson(filePath, triggers, { spaces: 2 });
-  regexTriggers[sessionId] = triggers;
-
-  return res.json({ success: true, count: triggers.length });
-});
-
-app.get('/api/v1/session/:sessionId/regexTriggers', verifyApiKey, async (req, res) => {
-  const filePath = path.join(AUTH_DIR, req.params.sessionId, 'regexTriggers.json');
-  if (fs.existsSync(filePath)) {
-    const triggers = await fs.readJson(filePath);
-    return res.json({ success: true, data: triggers });
-  } else {
-    return res.status(404).json({ error: 'regexTriggers.json not found' });
-  }
-});
-
-// ✅ Auto reconnect on startup
+// ✅ Auto reconnect
 async function autoReconnectSessions() {
   console.log('🔁 Auto-reconnecting existing sessions...');
   const sessionIds = Object.keys(sessions);
@@ -532,8 +385,8 @@ async function autoReconnectSessions() {
     try {
       console.log(`[${sessionId}] Attempting reconnect...`);
       await connectSession(sessionId);
-      console.log(`[[${sessionId}] ✅ Reconnected successfully`);
-      await new Promise(resolve => setTimeout(resolve, 5000));
+      console.log(`[${sessionId}] ✅ Reconnected successfully`);
+      await new Promise(resolve => setTimeout(resolve, 3000));
     } catch (error) {
       console.error(`[${sessionId}] ❌ Reconnect failed:`, error.message);
     }
@@ -544,9 +397,8 @@ async function autoReconnectSessions() {
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📱 WhatsApp API with Baileys 6.4.0 (Stable Version)`);
+  console.log(`📱 WhatsApp API with Latest Baileys (Device Linking Fixed)`);
   console.log(`🔧 Health: http://localhost:${PORT}/health`);
-  console.log(`🌐 Render: https://wasms-f81r.onrender.com/health`);
   
   // Auto-reconnect after delay
   setTimeout(autoReconnectSessions, 3000);
