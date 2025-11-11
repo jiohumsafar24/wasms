@@ -3,14 +3,17 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.18",
     "body-parser": "^1.20.2",
-    "cors": "^2.8.5",
+    "cors": "^2.8.5", 
     "express": "^4.18.2",
     "fs-extra": "^11.1.1",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "axios": "^1.6.0",
+    "@hapi/boom": "^10.0.1"
   }
 }
