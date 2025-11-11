@@ -44,56 +44,41 @@ function formatNumber(num) {
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 
-// ✅ HEALTH CHECK ENDPOINT (Add this at top)
+// ✅ HEALTH CHECK
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    service: 'WhatsApp API',
-    version: '1.0.0',
+    service: 'WhatsApp API - Baileys 6.4.0',
     sessions: Object.keys(sessions).length,
     activeConnections: Object.values(sockets).filter(s => s.isConnected).length,
-    timestamp: new Date().toISOString(),
-    endpoints: {
-      health: '/health',
-      createSession: 'POST /api/v1/session/:sessionId',
-      getQR: 'GET /api/v1/session/:sessionId/qr',
-      status: 'GET /api/v1/session/:sessionId/status'
-    }
+    timestamp: new Date().toISOString()
   });
 });
 
-// ✅ ADDITIONAL HEALTH CHECK
 app.get('/health', (req, res) => {
   res.json({
     status: 'online',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    sessions: Object.keys(sessions).length
-  });
-});
-
-app.get('/whatsapp/health', (req, res) => {
-  res.json({
-    status: 'online',
-    service: 'WhatsApp API - Plesk Subdirectory',
+    baileysVersion: '6.4.0',
     timestamp: new Date().toISOString(),
     sessions: Object.keys(sessions).length
   });
 });
 
+// API Key Verification
 function verifyApiKey(req, res, next) {
-  const apiKey = req.header('Authorization')?.replace('Bearer ', '');
+  const apiKey = req.header('Authorization')?.replace('Bearer ', '') || req.query.apiKey;
   const { sessionId } = req.params;
+  
   if (!apiKey || sessions[sessionId] !== apiKey) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
 }
 
-// ✅ FIXED: Safe file write function
+// ✅ SAFE file write function
 async function safeWriteSessions() {
   try {
     await fs.writeJson(SESSIONS_FILE, sessions, { spaces: 2 });
@@ -104,312 +89,245 @@ async function safeWriteSessions() {
   }
 }
 
+// ✅ FIXED: WhatsApp connection for Baileys 6.4.0
 async function connectSession(sessionId) {
   try {
+    console.log(`[${sessionId}] 🔄 Initializing WhatsApp connection...`);
+    
     const authPath = path.join(AUTH_DIR, sessionId);
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
 
-    // ✅ FIXED: Proper socket cleanup
-    if (sockets[sessionId]) {
-      if (sockets[sessionId].isConnected) {
-        console.log(`[${sessionId}] ♻️ Already connected, skipping new init`);
-        return sockets[sessionId];
-      } else {
-        console.log(`[${sessionId}] ♻️ Stale socket found, replacing...`);
-        try {
-          delete sockets[sessionId];
-        } catch (e) {
-          console.error(`[${sessionId}] Cleanup error:`, e.message);
-        }
-      }
-    }
-
-    const sock = makeWASocket({ 
+    const sock = makeWASocket({
       auth: state,
-      printQRInTerminal: true, // ✅ Terminal pe QR dikhaye
-      keepAliveIntervalMs: 10000
+      printQRInTerminal: true, // ✅ 6.4.0 mein yeh work karta hai
+      logger: {
+        level: 'fatal' // ✅ Only fatal errors show karega
+      },
+      browser: ['Ubuntu', 'Chrome', '110.0.5481.100'],
+      markOnlineOnConnect: false
     });
 
     sock.isConnected = false;
-    sock.sessionId = sessionId; // ✅ Session ID add karo
+    sock.sessionId = sessionId;
     sockets[sessionId] = sock;
 
+    // Save credentials when updated
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', async update => {
+    // Handle connection updates
+    sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
+      // ✅ QR Code generation - FIXED
       if (qr) {
-        console.log(`[${sessionId}] 📱 QR Code Received`);
-        sock.lastQR = qr; // ✅ Store raw QR data
+        console.log(`[${sessionId}] 📱 QR Code received`);
+        try {
+          const qrImage = await QRCode.toDataURL(qr);
+          sock.lastQR = qrImage;
+          console.log(`[${sessionId}] ✅ QR Code generated successfully`);
+        } catch (error) {
+          console.error(`[${sessionId}] ❌ QR generation error:`, error.message);
+        }
       }
 
+      // Connection opened
       if (connection === 'open') {
         sock.isConnected = true;
-        sock.lastQR = null; // ✅ Clear QR after connection
-        console.log(`[${sessionId}] ✅ WhatsApp connected`);
-
-        // 🔁 Load configurations
-        const autoReplyPath = path.join(authPath, 'autoReplies.json');
-        if (fs.existsSync(autoReplyPath)) {
-          autoReplies[sessionId] = await fs.readJson(autoReplyPath);
-          console.log(`[${sessionId}] 🔁 Loaded autoReplies`);
-        } else {
-          autoReplies[sessionId] = [];
-        }
-
-        const regexTriggerPath = path.join(authPath, 'regexTriggers.json');
-        if (fs.existsSync(regexTriggerPath)) {
-          regexTriggers[sessionId] = await fs.readJson(regexTriggerPath);
-          console.log(`[${sessionId}] 🔁 Loaded regexTriggers`);
-        } else {
-          regexTriggers[sessionId] = [];
-        }
-
-        const regexTriggerProPath = path.join(authPath, 'regexTriggersPro.json');
-        if (fs.existsSync(regexTriggerProPath)) {
-          regexTriggersPro[sessionId] = await fs.readJson(regexTriggerProPath);
-          console.log(`[${sessionId}] 🔁 Loaded regexTriggersPro`);
-        } else {
-          regexTriggersPro[sessionId] = [];
-        }
+        sock.lastQR = null;
+        console.log(`[${sessionId}] ✅ WhatsApp connected successfully!`);
       }
 
+      // Connection closed
       if (connection === 'close') {
         sock.isConnected = false;
         const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
         console.log(`[${sessionId}] ⚠️ Disconnected:`, reason);
 
         if (reason === DisconnectReason.loggedOut) {
-          console.log(`[${sessionId}] ❌ Logged out. Cleaning up...`);
-          try {
-            await fs.remove(authPath);
-          } catch (e) {
-            console.error(`[${sessionId}] Cleanup error:`, e.message);
-          }
+          console.log(`[${sessionId}] ❌ Logged out`);
         } else {
-          console.log(`[${sessionId}] 🔄 Reconnecting in 5s...`);
-          setTimeout(() => connectSession(sessionId), 5000);
+          console.log(`[${sessionId}] 🔄 Reconnecting in 10s...`);
+          setTimeout(() => connectSession(sessionId), 10000);
         }
       }
     });
 
-    // 📩 Message handler
+    // Handle incoming messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify' || !messages?.[0]) return;
+      
       const msg = messages[0];
       if (msg.key.fromMe) return;
 
       const from = msg.key.remoteJid;
       const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text;
+
       if (!text) return;
 
-      // ✅ RegexTriggersPro
-      const proTriggers = regexTriggersPro[sessionId] || [];
-      for (const trigger of proTriggers) {
-        try {
-          const regex = new RegExp(trigger.regex, 'i');
-          const allowedNumbers = trigger.target_number
-            .split(',')
-            .map(num => formatNumber(num.trim()))
-            .filter(Boolean);
+      console.log(`[${sessionId}] 📩 Message from ${from}: ${text}`);
 
-          if (!allowedNumbers.includes(from)) continue;
-
-          if (regex.test(text)) {
-            const match = text.match(regex);
-            const keyword = match?.[0];
-
-            const payload = {
-              keyword,
-              name: trigger.name,
-              pattern: trigger.regex
-            };
-
-            try {
-              const res = await axios.post(trigger.callback_url, payload, { timeout: 10000 });
-              const replyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-              await sock.sendMessage(from, { text: replyText });
-            } catch (err) {
-              console.error(`[${sessionId}] ❌ Pro Trigger Callback Error:`, err.message);
-              await sock.sendMessage(from, { text: '❌ Error processing your request.' });
-            }
-            break;
-          }
-        } catch (err) {
-          console.error(`[${sessionId}] ❌ Invalid regexPro pattern: ${trigger.regex}`, err.message);
-        }
-      }
-
-      // ✅ Auto Replies
+      // Process auto-replies
       const replies = autoReplies[sessionId] || [];
       const lowerText = text.toLowerCase().trim();
 
       for (const { keyword, reply } of replies) {
         const cleanedText = lowerText.replace(/[^a-z0-9]/gi, '');
-        const cleanedKeyword = keyword.replace(/[^a-z0-9]/gi, '');
+        const cleanedKeyword = keyword.toLowerCase().replace(/[^a-z0-9]/gi, '');
+        
         if (cleanedText === cleanedKeyword) {
-          await new Promise(r => setTimeout(r, 1500));
-          await sock.sendMessage(from, { text: reply });
+          try {
+            await sock.sendMessage(from, { text: reply });
+          } catch (error) {
+            console.error(`[${sessionId}] ❌ Auto-reply error:`, error.message);
+          }
           return;
         }
       }
-
-      // ✅ Regex Triggers
-      const triggers = regexTriggers[sessionId] || [];
-      const matchedTriggers = [];
-
-      for (const trigger of triggers) {
-        try {
-          const regex = new RegExp(trigger.regex, 'i');
-          if (regex.test(text)) {
-            matchedTriggers.push(trigger);
-          }
-        } catch (err) {
-          console.error(`[${sessionId}] ❌ Regex error in pattern "${trigger.regex}":`, err.message);
-        }
-      }
-
-      if (matchedTriggers.length > 0) {
-        const bestMatch = matchedTriggers.reduce((a, b) =>
-          b.regex.length > a.regex.length ? b : a
-        );
-
-        try {
-          const regex = new RegExp(bestMatch.regex, 'i');
-          const match = text.match(regex);
-          const keyword = match[0];
-
-          const payload = {
-            keyword: keyword,
-            name: bestMatch.name,
-            pattern: bestMatch.regex
-          };
-
-          const res = await axios.post(bestMatch.callback_url, payload, { timeout: 10000 });
-          const replyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-          await sock.sendMessage(from, { text: replyText });
-        } catch (err) {
-          console.error(`[${sessionId}] ❌ Callback error:`, err.message);
-          await sock.sendMessage(from, {
-            text: '❌ Error processing your request. Please try again.'
-          });
-        }
-        return;
-      }
     });
 
+    console.log(`[${sessionId}] ✅ WhatsApp client initialized`);
     return sock;
+
   } catch (error) {
     console.error(`[${sessionId}] ❌ Connection error:`, error.message);
     throw error;
   }
 }
 
-// ✅ FIXED: Create session with safe write
+// ✅ API ROUTES
+
+// Create session
 app.post('/api/v1/session/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
   const { apiKey } = req.body;
-  if (!apiKey) return res.status(400).json({ error: 'apiKey required' });
+  
+  if (!apiKey) {
+    return res.status(400).json({ error: 'apiKey is required' });
+  }
 
-  sessions[sessionId] = apiKey;
-  const success = await safeWriteSessions();
-
-  if (success) {
-    return res.json({ success: true, sessionId, apiKey });
-  } else {
-    return res.status(500).json({ error: 'Failed to save session' });
+  try {
+    sessions[sessionId] = apiKey;
+    await safeWriteSessions();
+    
+    res.json({ 
+      success: true, 
+      sessionId, 
+      apiKey,
+      message: 'Session created successfully' 
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
-// ✅ FIXED: QR Code with better error handling
+// ✅ FIXED: QR Code API
 app.get('/api/v1/session/:sessionId/qr', verifyApiKey, async (req, res) => {
   const { sessionId } = req.params;
 
   try {
-    if (!sockets[sessionId]) {
-      await connectSession(sessionId);
-    }
-
-    if (sockets[sessionId].isConnected) {
-      return res.json({ connected: true });
-    }
-
-    const qr = sockets[sessionId].lastQR;
-    if (!qr) {
-      return res.status(503).json({ 
-        status: 'waiting', 
-        message: 'QR not yet generated. Please wait...' 
+    let sock = sockets[sessionId];
+    
+    // Check if already connected
+    if (sock?.isConnected) {
+      return res.json({ 
+        success: true, 
+        connected: true,
+        message: 'Already connected to WhatsApp' 
       });
     }
 
-    // ✅ Generate QR image
-    const qrImage = await QRCode.toDataURL(qr);
-    return res.json({ connected: false, qr: qrImage });
+    // Initialize new connection if not exists
+    if (!sock) {
+      sock = await connectSession(sessionId);
+    }
+
+    // Wait for QR code (longer timeout for Render.com)
+    let qrFound = false;
+    for (let i = 0; i < 60; i++) { // 60 seconds timeout
+      if (sock.lastQR) {
+        qrFound = true;
+        return res.json({
+          success: true,
+          connected: false,
+          qr: sock.lastQR,
+          message: 'Scan QR code with WhatsApp'
+        });
+      }
+      
+      // Check if connected while waiting
+      if (sock.isConnected) {
+        return res.json({ 
+          success: true, 
+          connected: true,
+          message: 'Connected to WhatsApp!' 
+        });
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+
+    // Timeout
+    if (!qrFound) {
+      res.status(408).json({
+        success: false,
+        error: 'QR generation timeout',
+        message: 'Render.com free tier might be slow. Please try again.'
+      });
+    }
 
   } catch (error) {
-    console.error(`[${sessionId}] QR Error:`, error.message);
-    return res.status(500).json({ 
-      error: 'Failed to generate QR code',
-      message: error.message 
+    console.error(`[${sessionId}] QR API error:`, error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: 'Failed to generate QR code'
     });
   }
 });
 
+// Check status
 app.get('/api/v1/session/:sessionId/status', verifyApiKey, (req, res) => {
-  const sock = sockets[req.params.sessionId];
-  return res.json({ 
+  const { sessionId } = req.params;
+  const sock = sockets[sessionId];
+  
+  res.json({
+    success: true,
     connected: sock?.isConnected || false,
-    sessionId: req.params.sessionId
+    sessionId: sessionId
   });
 });
 
-// ✅ Text Message
+// Send text message
 app.post('/api/v1/session/:sessionId/sendText', verifyApiKey, async (req, res) => {
   const { sessionId } = req.params;
   const { to, text } = req.body;
 
   const sock = sockets[sessionId];
-  if (!sock?.isConnected) return res.status(409).json({ error: 'Not connected' });
+  if (!sock) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
 
-  const jid = formatNumber(to);
-  if (!jid) return res.status(400).json({ error: 'Invalid phone number' });
+  if (!sock.isConnected) {
+    return res.status(409).json({ error: 'Not connected to WhatsApp' });
+  }
 
   try {
-    await new Promise(r => setTimeout(r, 1500));
+    const jid = formatNumber(to);
+    if (!jid) {
+      return res.status(400).json({ error: 'Invalid phone number' });
+    }
+
     await sock.sendMessage(jid, { text });
-    return res.json({ success: true });
-  } catch (e) {
-    return res.status(500).json({ error: e.toString() });
+    res.json({ success: true, message: 'Message sent successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Other API endpoints (same as your code, just ensure error handling)
-// ... [Rest of your API endpoints remain the same]
-
-// ✅ FIXED: Auto reconnect with error handling
-(async () => {
-  console.log('🔁 Auto reconnecting sessions on startup...');
-  const storedSessions = Object.keys(sessions);
-  
-  for (const sessionId of storedSessions) {
-    console.log(`[${sessionId}] Attempting reconnect...`);
-    try {
-      await connectSession(sessionId);
-      console.log(`[${sessionId}] ✅ Reconnected successfully`);
-    } catch (err) {
-      console.error(`[${sessionId}] ❌ Failed to reconnect:`, err.message);
-    }
-    // Add delay between reconnections
-    await new Promise(resolve => setTimeout(resolve, 2000));
-  }
-})();
-
-// 🔊 Start Server
-const PORT = process.env.PORT || 3333;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log(`📱 WhatsApp API Service Started`);
-  console.log(`🔧 Health Check: http://localhost:${PORT}/health`);
-  console.log(`🌐 Plesk URL: https://example.com/whatsapp/`);
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📱 WhatsApp API with Baileys 6.4.0 (Fixed Version)`);
+  console.log(`🌐 Health: https://wasms-f81r.onrender.com/health`);
 });
