@@ -2,9 +2,7 @@ const express = require('express');
 const {
   default: makeWASocket,
   DisconnectReason,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  Browsers
+  useMultiFileAuthState
 } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const fs = require('fs-extra');
@@ -53,7 +51,7 @@ app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    service: 'WhatsApp API - Latest Baileys',
+    service: 'WhatsApp API - Baileys 6.4.0',
     sessions: Object.keys(sessions).length,
     activeConnections: Object.values(sockets).filter(s => s.isConnected).length,
     timestamp: new Date().toISOString()
@@ -64,6 +62,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'online',
     service: 'WhatsApp API',
+    baileysVersion: '6.4.0',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     sessions: Object.keys(sessions).length,
@@ -91,39 +90,24 @@ async function safeWriteSessions() {
   }
 }
 
-// ✅ FIXED: WhatsApp connection with PROPER device linking
+// ✅ FIXED: WhatsApp connection for Baileys 6.4.0 (NO LOGGER ISSUES)
 async function connectSession(sessionId) {
   try {
     console.log(`[${sessionId}] 🔄 Initializing WhatsApp connection...`);
     
     const authPath = path.join(AUTH_DIR, sessionId);
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
-    
-    // ✅ Latest version fetch karein for compatibility
-    const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
       auth: state,
-      version,
-      printQRInTerminal: true,
-      // ✅ PROPER browser configuration for device linking
-      browser: Browsers.ubuntu('Chrome'),
-      // ✅ Better connection settings
-      markOnlineOnConnect: true,
-      syncFullHistory: false,
-      generateHighQualityLinkPreview: true,
-      // ✅ Mobile device linking ke liye important settings
-      mobile: false, // Yehi line fix karti hai "cloud not login" error
-      connectTimeoutMs: 60000,
-      keepAliveIntervalMs: 10000,
-      logger: {
-        level: 'silent' // Optional: Less logs
-      }
+      printQRInTerminal: true, // ✅ 6.4.0 mein yeh work karta hai
+      // ✅ NO LOGGER - Baileys 6.4.0 compatible
+      browser: ['Ubuntu', 'Chrome', '110.0.5481.100'],
+      markOnlineOnConnect: false
     });
 
     sock.isConnected = false;
     sock.sessionId = sessionId;
-    sock.lastQR = null;
     sockets[sessionId] = sock;
 
     // Save credentials when updated
@@ -131,14 +115,7 @@ async function connectSession(sessionId) {
 
     // Handle connection updates
     sock.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr, isNewLogin, receivedPendingNotifications } = update;
-
-      console.log(`[${sessionId}] Connection update:`, {
-        connection,
-        qr: !!qr,
-        isNewLogin,
-        receivedPendingNotifications
-      });
+      const { connection, lastDisconnect, qr } = update;
 
       // ✅ QR Code generation
       if (qr) {
@@ -156,7 +133,6 @@ async function connectSession(sessionId) {
         sock.isConnected = true;
         sock.lastQR = null;
         console.log(`[${sessionId}] ✅ WhatsApp connected successfully!`);
-        console.log(`[${sessionId}] 📱 Device properly linked with mobile`);
 
         // Load configurations
         try {
@@ -185,16 +161,10 @@ async function connectSession(sessionId) {
         console.log(`[${sessionId}] ⚠️ Disconnected:`, reason);
 
         if (reason === DisconnectReason.loggedOut) {
-          console.log(`[${sessionId}] ❌ Logged out - clearing auth`);
-          // Clear auth data
-          try {
-            await fs.remove(authPath);
-          } catch (e) {
-            console.error(`[${sessionId}] Error clearing auth:`, e.message);
-          }
+          console.log(`[${sessionId}] ❌ Logged out`);
         } else {
-          console.log(`[${sessionId}] 🔄 Reconnecting in 5s...`);
-          setTimeout(() => connectSession(sessionId), 5000);
+          console.log(`[${sessionId}] 🔄 Reconnecting in 10s...`);
+          setTimeout(() => connectSession(sessionId), 10000);
         }
       }
     });
@@ -241,7 +211,7 @@ async function connectSession(sessionId) {
   }
 }
 
-// ✅ API ROUTES (Same as before)
+// ✅ API ROUTES
 
 // Create session
 app.post('/api/v1/session/:sessionId', async (req, res) => {
@@ -267,7 +237,7 @@ app.post('/api/v1/session/:sessionId', async (req, res) => {
   }
 });
 
-// ✅ QR Code API
+// ✅ FIXED: QR Code API
 app.get('/api/v1/session/:sessionId/qr', verifyApiKey, async (req, res) => {
   const { sessionId } = req.params;
 
@@ -290,7 +260,7 @@ app.get('/api/v1/session/:sessionId/qr', verifyApiKey, async (req, res) => {
 
     // Wait for QR code
     let qrFound = false;
-    for (let i = 0; i < 30; i++) { // Reduced timeout to 30 seconds
+    for (let i = 0; i < 60; i++) {
       if (sock.lastQR) {
         qrFound = true;
         return res.json({
@@ -371,7 +341,7 @@ app.post('/api/v1/session/:sessionId/sendText', verifyApiKey, async (req, res) =
   }
 });
 
-// ✅ Auto reconnect
+// ✅ FIXED: Auto reconnect with better error handling
 async function autoReconnectSessions() {
   console.log('🔁 Auto-reconnecting existing sessions...');
   const sessionIds = Object.keys(sessions);
@@ -386,7 +356,8 @@ async function autoReconnectSessions() {
       console.log(`[${sessionId}] Attempting reconnect...`);
       await connectSession(sessionId);
       console.log(`[${sessionId}] ✅ Reconnected successfully`);
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      // Wait between reconnections
+      await new Promise(resolve => setTimeout(resolve, 5000));
     } catch (error) {
       console.error(`[${sessionId}] ❌ Reconnect failed:`, error.message);
     }
@@ -397,8 +368,9 @@ async function autoReconnectSessions() {
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📱 WhatsApp API with Latest Baileys (Device Linking Fixed)`);
+  console.log(`📱 WhatsApp API with Baileys 6.4.0 (Stable Version)`);
   console.log(`🔧 Health: http://localhost:${PORT}/health`);
+  console.log(`🌐 Render: https://wasms-f81r.onrender.com/health`);
   
   // Auto-reconnect after delay
   setTimeout(autoReconnectSessions, 3000);
